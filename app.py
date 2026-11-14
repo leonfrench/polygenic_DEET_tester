@@ -305,11 +305,6 @@ with st.sidebar:
     species = st.selectbox(
         "Species of input genes:", options=["Human", "Mouse", "Rhesus Macaque"]
     )
-    st.caption(
-        "Use the selected species for both target and background lists. "
-        "Mouse and rhesus macaque symbols are converted to human orthologs. "
-        "The default example uses human symbols."
-    )
 
     gene_text = st.text_area(
         "Input your gene list:",
