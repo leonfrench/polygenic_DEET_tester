@@ -1,4 +1,4 @@
-"""Build signed unadjusted-significance DEET rank Parquet shards and metadata.
+"""Build signed and unsigned-significance DEET rank Parquet shards and metadata.
 
 Reads:
   - DEET_short_final_Aug2022.rds (from https://www.wilsonlab.org/public/DEET_data/intermediary_files/DEET_short_final_Aug2022.rds)
@@ -7,23 +7,29 @@ Reads:
   - DEET_metadata_table_2023-01-28.txt
   - data/protein_coding_genes.txt.gz
 
-Why signed DESeq2 test statistic (`stat`) instead of `padj`:
+Why DESeq2 test statistic (`stat`) instead of `padj`:
   - `padj` (Benjamini-Hochberg FDR) clamps the majority of genes in each comparison
     to `padj = 1` (and creates step-function plateaus elsewhere), causing massive ties.
   - Within every comparison, DESeq2 computes unadjusted p-values directly from `stat`
     via a strictly monotonic 1-to-1 survival function:
       * Wald comparisons: p_unadj = 2 * Phi(-|stat|)
       * LRT comparisons:  p_unadj = P(chi^2_df > max(stat, 0))  (fixed df per comparison)
-  - Ranking by `sign(log2FoldChange) * stat_magnitude` (with `log2FoldChange` breaking
-    any remaining ties, e.g. undetected genes with stat = 0) produces the EXACT same
-    within-comparison gene ordering as `sign(log2FoldChange) * -log10(p_unadjusted)`
-    without BH `padj = 1` ties and without float64 underflow at p < 1e-308.
+  - Signed ranking (`sign(log2FoldChange) * stat_magnitude`, tie-broken by `log2FoldChange`)
+    produces the exact same within-comparison gene ordering as
+    `sign(log2FoldChange) * -log10(p_unadjusted)` without BH `padj = 1` ties and without
+    float64 underflow at p < 1e-308.
+  - Unsigned significance ranking (`stat_magnitude`, tie-broken by `|log2FoldChange|`)
+    ranks genes from 1 (least significant) to N (most significantly differentially
+    expressed regardless of direction), equivalent to `-log10(p_unadjusted)`.
 
 Output shards (lossless doubled uint16 average ranks, Zstandard-compressed):
-  - data/deet_ranks_sra.parquet  (SRA, SRA-manual, RecountBrain; 611 comparisons)
-  - data/deet_ranks_tcga.parquet (TCGA; 957 comparisons)
-  - data/deet_ranks_gtex.parquet (GTEx; 1,594 comparisons)
-  - data/deet_metadata.parquet   (3,162 comparisons)
+  - data/deet_ranks_sra.parquet           (signed; 611 comparisons)
+  - data/deet_ranks_tcga.parquet          (signed; 957 comparisons)
+  - data/deet_ranks_gtex.parquet          (signed; 1,594 comparisons)
+  - data/deet_unsigned_ranks_sra.parquet  (unsigned significance; 611 comparisons)
+  - data/deet_unsigned_ranks_tcga.parquet (unsigned significance; 957 comparisons)
+  - data/deet_unsigned_ranks_gtex.parquet (unsigned significance; 1,594 comparisons)
+  - data/deet_metadata.parquet            (3,162 comparisons)
 """
 
 from __future__ import annotations
@@ -56,7 +62,9 @@ protein_coding_path <- args[2]
 out_genes_path <- args[3]
 out_profiles_path <- args[4]
 out_bin_path <- args[5]
-out_stats_path <- args[6]
+out_unsigned_bin_path <- args[6]
+out_stats_path <- args[7]
+unsigned_only <- identical(args[8], "1")
 
 t0 <- proc.time()[["elapsed"]]
 pc_allowed <- unique(trimws(readLines(protein_coding_path, warn = FALSE)))
@@ -100,10 +108,29 @@ if (2L * n_genes > 65535L) {
   stop("2 * n_genes exceeds uint16 max!")
 }
 
-doubled_mat <- matrix(0L, nrow = n_genes, ncol = n_cols)
+compute_doubled_ranks <- function(primary, secondary, n_genes) {
+  ord <- order(primary, secondary, method = "radix")
+  p_s <- primary[ord]
+  s_s <- secondary[ord]
+
+  is_new <- c(TRUE, (p_s[-1L] != p_s[-n_genes]) | (s_s[-1L] != s_s[-n_genes]))
+  starts <- which(is_new)
+  ends <- c(starts[-1L] - 1L, n_genes)
+  counts <- ends - starts + 1L
+  # starts and ends are 1-based in R, so doubled average rank is (starts + ends)
+  group_doubled <- starts + ends
+
+  col_doubled <- integer(n_genes)
+  col_doubled[ord] <- rep.int(group_doubled, counts)
+  list(doubled = col_doubled, n_unique = length(starts))
+}
+
+doubled_mat <- if (unsigned_only) NULL else matrix(0L, nrow = n_genes, ncol = n_cols)
+unsigned_doubled_mat <- matrix(0L, nrow = n_genes, ncol = n_cols)
 n_wald <- 0L
 n_lrt <- 0L
 unique_rank_counts <- integer(n_cols)
+unsigned_unique_rank_counts <- integer(n_cols)
 detected_counts <- integer(n_cols)
 monotonic_violations <- 0L
 
@@ -146,53 +173,71 @@ for (j in seq_len(n_cols)) {
     }
   }
 
-  primary <- sign(lfc) * stat_mag
-  secondary <- lfc
+  if (!unsigned_only) {
+    signed_res <- compute_doubled_ranks(sign(lfc) * stat_mag, lfc, n_genes)
+    doubled_mat[, j] <- signed_res$doubled
+    unique_rank_counts[j] <- signed_res$n_unique
+  }
 
-  ord <- order(primary, secondary, method = "radix")
-  p_s <- primary[ord]
-  s_s <- secondary[ord]
-
-  is_new <- c(TRUE, (p_s[-1L] != p_s[-n_genes]) | (s_s[-1L] != s_s[-n_genes]))
-  starts <- which(is_new)
-  ends <- c(starts[-1L] - 1L, n_genes)
-  counts <- ends - starts + 1L
-  # starts and ends are 1-based in R, so doubled average rank is (starts + ends)
-  group_doubled <- starts + ends
-
-  col_doubled <- integer(n_genes)
-  col_doubled[ord] <- rep.int(group_doubled, counts)
-  doubled_mat[, j] <- col_doubled
-  unique_rank_counts[j] <- length(starts)
+  unsigned_res <- compute_doubled_ranks(stat_mag, abs(lfc), n_genes)
+  unsigned_doubled_mat[, j] <- unsigned_res$doubled
+  unsigned_unique_rank_counts[j] <- unsigned_res$n_unique
 }
 
 writeLines(all_genes, out_genes_path)
 writeLines(profile_names, out_profiles_path)
 
-con <- file(out_bin_path, "wb")
-# Write column-major uint16 (size = 2 bytes, little-endian)
-writeBin(as.integer(doubled_mat), con, size = 2L, endian = "little")
-close(con)
+if (!unsigned_only) {
+  con <- file(out_bin_path, "wb")
+  # Write column-major uint16 (size = 2 bytes, little-endian)
+  writeBin(as.integer(doubled_mat), con, size = 2L, endian = "little")
+  close(con)
+}
+
+con_u <- file(out_unsigned_bin_path, "wb")
+writeBin(as.integer(unsigned_doubled_mat), con_u, size = 2L, endian = "little")
+close(con_u)
 
 stats_json <- sprintf(
-  '{"n_genes": %d, "n_cols": %d, "n_wald": %d, "n_lrt": %d, "monotonic_violations": %d, "median_detected": %.1f, "median_unique_ranks": %.1f}',
+  '{"n_genes": %d, "n_cols": %d, "n_wald": %d, "n_lrt": %d, "monotonic_violations": %d, "median_detected": %.1f, "median_unique_ranks": %.1f, "median_unsigned_unique_ranks": %.1f}',
   n_genes, n_cols, n_wald, n_lrt, monotonic_violations,
-  median(detected_counts), median(unique_rank_counts)
+  median(detected_counts), median(unique_rank_counts), median(unsigned_unique_rank_counts)
 )
 writeLines(stats_json, out_stats_path)
 cat("Extraction stats:", stats_json, "\n")
 """
 
 
+def _read_doubled_rank_buffer(
+    bin_path: Path, n_genes: int, n_profiles: int
+) -> np.ndarray:
+    raw_u16 = np.fromfile(bin_path, dtype="<u2")
+    expected_len = n_genes * n_profiles
+    if len(raw_u16) != expected_len:
+        raise ValueError(
+            f"Binary rank buffer length mismatch: {len(raw_u16)} vs {expected_len}"
+        )
+    # R wrote column-major (Fortran order)
+    return np.ndarray(
+        shape=(n_genes, n_profiles),
+        dtype=np.uint16,
+        buffer=raw_u16.tobytes(),
+        order="F",
+    ).copy(order="C")
+
+
 def extract_ranks_via_r(
-    rdata_path: Path, protein_coding_path: Path
-) -> tuple[np.ndarray, list[str], np.ndarray, dict]:
+    rdata_path: Path,
+    protein_coding_path: Path,
+    unsigned_only: bool = False,
+) -> tuple[np.ndarray, list[str], np.ndarray | None, np.ndarray, dict]:
     with tempfile.TemporaryDirectory(prefix="deet_extract_") as tmp:
         tmp_dir = Path(tmp)
         r_script = tmp_dir / "extract.R"
         genes_txt = tmp_dir / "genes.txt"
         profiles_txt = tmp_dir / "profiles.txt"
         ranks_bin = tmp_dir / "doubled_ranks.bin"
+        unsigned_ranks_bin = tmp_dir / "unsigned_doubled_ranks.bin"
         stats_json = tmp_dir / "stats.json"
 
         r_script.write_text(R_EXTRACT_SCRIPT, encoding="utf-8")
@@ -205,7 +250,9 @@ def extract_ranks_via_r(
                 str(genes_txt),
                 str(profiles_txt),
                 str(ranks_bin),
+                str(unsigned_ranks_bin),
                 str(stats_json),
+                "1" if unsigned_only else "0",
             ],
             check=True,
         )
@@ -216,21 +263,16 @@ def extract_ranks_via_r(
         profiles = profiles_txt.read_text(encoding="utf-8").splitlines()
         stats = json.loads(stats_json.read_text(encoding="utf-8"))
 
-        raw_u16 = np.fromfile(ranks_bin, dtype="<u2")
-        expected_len = len(genes) * len(profiles)
-        if len(raw_u16) != expected_len:
-            raise ValueError(
-                f"Binary rank buffer length mismatch: {len(raw_u16)} vs {expected_len}"
-            )
-        # R wrote column-major (Fortran order)
-        doubled_ranks = np.ndarray(
-            shape=(len(genes), len(profiles)),
-            dtype=np.uint16,
-            buffer=raw_u16.tobytes(),
-            order="F",
-        ).copy(order="C")
+        doubled_ranks = (
+            None
+            if unsigned_only
+            else _read_doubled_rank_buffer(ranks_bin, len(genes), len(profiles))
+        )
+        unsigned_doubled_ranks = _read_doubled_rank_buffer(
+            unsigned_ranks_bin, len(genes), len(profiles)
+        )
 
-    return genes, profiles, doubled_ranks, stats
+    return genes, profiles, doubled_ranks, unsigned_doubled_ranks, stats
 
 
 def verify_directions(
@@ -275,11 +317,22 @@ def verify_directions(
     )
 
 
+SIGNED_RANKING_METRIC = (
+    b"sign(log2FC) * DESeq2_stat_magnitude "
+    b"(unadjusted p-value order), tie-broken by log2FC"
+)
+UNSIGNED_RANKING_METRIC = (
+    b"DESeq2_stat_magnitude "
+    b"(unsigned unadjusted p-value significance order), tie-broken by abs(log2FC)"
+)
+
+
 def write_rank_shard(
     out_path: Path,
     genes: np.ndarray,
     profile_names: list[str],
     doubled_sub: np.ndarray,
+    ranking_metric: bytes = SIGNED_RANKING_METRIC,
 ) -> None:
     arrays = [pa.array(genes, type=pa.string())] + [
         pa.array(doubled_sub[:, j], type=pa.uint16())
@@ -290,10 +343,7 @@ def write_rank_shard(
         + [pa.field(name, pa.uint16()) for name in profile_names],
         metadata={
             b"rank_encoding": b"doubled_uint16",
-            b"ranking_metric": (
-                b"sign(log2FC) * DESeq2_stat_magnitude "
-                b"(unadjusted p-value order), tie-broken by log2FC"
-            ),
+            b"ranking_metric": ranking_metric,
         },
     )
     table = pa.Table.from_arrays(arrays, schema=schema)
@@ -812,6 +862,48 @@ def build_metadata(meta_txt_path: Path, profile_set: set[str]) -> pd.DataFrame:
     return meta
 
 
+def verify_unsigned_significance(
+    genes: np.ndarray,
+    profiles: list[str],
+    unsigned_doubled_ranks: np.ndarray,
+    meta: pd.DataFrame,
+) -> None:
+    gene_to_idx = {g: i for i, g in enumerate(genes)}
+    col_to_idx = {c: j for j, c in enumerate(profiles)}
+    midpoint = len(genes) + 1  # in doubled rank units, midpoint is (N + 1)
+
+    up_ok = 0
+    up_total = 0
+    down_ok = 0
+    down_total = 0
+
+    for row in meta.itertuples(index=False):
+        j = col_to_idx[row.DEET_ID]
+        col = unsigned_doubled_ranks[:, j].astype(np.float64)
+
+        if isinstance(row.DEGs_Up, str) and row.DEGs_Up:
+            u_idx = [gene_to_idx[g] for g in row.DEGs_Up.split(";") if g in gene_to_idx]
+            if u_idx:
+                up_total += 1
+                if col[u_idx].mean() > midpoint:
+                    up_ok += 1
+
+        if isinstance(row.DEGs_Down, str) and row.DEGs_Down:
+            d_idx = [gene_to_idx[g] for g in row.DEGs_Down.split(";") if g in gene_to_idx]
+            if d_idx:
+                down_total += 1
+                if col[d_idx].mean() > midpoint:
+                    down_ok += 1
+
+    print(
+        f"Unsigned significance verification across protein-coding top DEGs:\n"
+        f"  DEGs.Up   mean unsigned rank > midpoint: {up_ok:,} / {up_total:,} "
+        f"({100 * up_ok / max(1, up_total):.2f}%)\n"
+        f"  DEGs.Down mean unsigned rank > midpoint: {down_ok:,} / {down_total:,} "
+        f"({100 * down_ok / max(1, down_total):.2f}%)"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -834,19 +926,29 @@ def main() -> None:
         type=Path,
         default=Path(__file__).resolve().parent / "data",
     )
+    parser.add_argument(
+        "--unsigned-only",
+        action="store_true",
+        help="Write only deet_unsigned_ranks_*.parquet aligned to existing metadata and signed shards.",
+    )
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.perf_counter()
-    genes, profiles, doubled_ranks, stats = extract_ranks_via_r(
-        args.short_final, args.protein_coding
+    genes, profiles, doubled_ranks, unsigned_doubled_ranks, stats = extract_ranks_via_r(
+        args.short_final, args.protein_coding, unsigned_only=args.unsigned_only
     )
     if stats["monotonic_violations"] != 0:
         raise ValueError(
             f"Detected {stats['monotonic_violations']} monotonicity violations vs padj!"
         )
 
-    meta = build_metadata(args.meta, set(profiles))
+    if args.unsigned_only:
+        meta_path = args.out_dir / "deet_metadata.parquet"
+        meta = pd.read_parquet(meta_path)
+    else:
+        meta = build_metadata(args.meta, set(profiles))
+
     verify_view = meta.rename(
         columns={
             "DEET.ID": "DEET_ID",
@@ -854,7 +956,9 @@ def main() -> None:
             "DEGs.Down": "DEGs_Down",
         }
     )
-    verify_directions(genes, profiles, doubled_ranks, verify_view)
+    if doubled_ranks is not None:
+        verify_directions(genes, profiles, doubled_ranks, verify_view)
+    verify_unsigned_significance(genes, profiles, unsigned_doubled_ranks, verify_view)
 
     col_to_idx = {c: j for j, c in enumerate(profiles)}
     total_written = 0
@@ -863,11 +967,32 @@ def main() -> None:
             meta["Source"].isin(source_labels), "DEET.ID"
         ].tolist()
         shard_indices = [col_to_idx[cid] for cid in shard_ids]
+
+        if args.unsigned_only:
+            signed_path = args.out_dir / f"deet_ranks_{shard_key}.parquet"
+            if signed_path.exists():
+                signed_tbl = pq.read_table(signed_path, columns=["gene_symbol"])
+                signed_genes = signed_tbl.column(0).to_numpy(zero_copy_only=False).astype(str)
+                signed_cols = pq.read_schema(signed_path).names[1:]
+                if not np.array_equal(genes, signed_genes):
+                    raise ValueError(f"Gene ordering mismatch against {signed_path.name}!")
+                if signed_cols != shard_ids:
+                    raise ValueError(f"Profile ordering mismatch against {signed_path.name}!")
+        elif doubled_ranks is not None:
+            write_rank_shard(
+                args.out_dir / f"deet_ranks_{shard_key}.parquet",
+                genes,
+                shard_ids,
+                doubled_ranks[:, shard_indices],
+                ranking_metric=SIGNED_RANKING_METRIC,
+            )
+
         write_rank_shard(
-            args.out_dir / f"deet_ranks_{shard_key}.parquet",
+            args.out_dir / f"deet_unsigned_ranks_{shard_key}.parquet",
             genes,
             shard_ids,
-            doubled_ranks[:, shard_indices],
+            unsigned_doubled_ranks[:, shard_indices],
+            ranking_metric=UNSIGNED_RANKING_METRIC,
         )
         total_written += len(shard_ids)
 
@@ -876,12 +1001,15 @@ def main() -> None:
             f"Shard count mismatch: wrote {total_written}, expected {len(profiles)}"
         )
 
-    meta_out = args.out_dir / "deet_metadata.parquet"
-    meta.to_parquet(meta_out, index=False, compression="zstd", compression_level=9)
-    print(
-        f"Wrote {meta_out.name}: {len(meta):,} rows "
-        f"({meta_out.stat().st_size / 1e6:.2f} MB) in {time.perf_counter() - t0:.1f}s total."
-    )
+    if not args.unsigned_only:
+        meta_out = args.out_dir / "deet_metadata.parquet"
+        meta.to_parquet(meta_out, index=False, compression="zstd", compression_level=9)
+        print(
+            f"Wrote {meta_out.name}: {len(meta):,} rows "
+            f"({meta_out.stat().st_size / 1e6:.2f} MB) in {time.perf_counter() - t0:.1f}s total."
+        )
+    else:
+        print(f"Completed unsigned shard build in {time.perf_counter() - t0:.1f}s total.")
 
 
 if __name__ == "__main__":

@@ -23,9 +23,12 @@ decompression is needed):
 
 | Grouping / Resource | File | Genes / Rows | Profiles | Size |
 | --- | --- | ---: | ---: | ---: |
-| SRA / Experimental | `deet_ranks_sra.parquet` | 19,444 | 611 | 25.3 MB |
-| TCGA | `deet_ranks_tcga.parquet` | 19,444 | 957 | 42.9 MB |
-| GTEx | `deet_ranks_gtex.parquet` | 19,444 | 1,594 | 74.2 MB |
+| SRA / Experimental (signed) | `deet_ranks_sra.parquet` | 19,444 | 611 | 25.3 MB |
+| TCGA (signed) | `deet_ranks_tcga.parquet` | 19,444 | 957 | 42.9 MB |
+| GTEx (signed) | `deet_ranks_gtex.parquet` | 19,444 | 1,594 | 74.2 MB |
+| SRA / Experimental (unsigned) | `deet_unsigned_ranks_sra.parquet` | 19,444 | 611 | 25.3 MB |
+| TCGA (unsigned) | `deet_unsigned_ranks_tcga.parquet` | 19,444 | 957 | 42.8 MB |
+| GTEx (unsigned) | `deet_unsigned_ranks_gtex.parquet` | 19,444 | 1,594 | 74.1 MB |
 | Comparison metadata | `deet_metadata.parquet` | 3,162 | — | 0.5 MB |
 | Ortholog mapping | `homologene_to_human.csv.gz` | 35,983 | — | 0.2 MB |
 | Protein-coding gene list | `protein_coding_genes.txt.gz` | 20,341 | — | 0.05 MB |
@@ -81,6 +84,14 @@ in the earlier R Shiny prototype:
     `Lower Group = Group.Up` (e.g., `INTERFERON` vs `no INTERFERON`,
     `no idiopathic heart disease` vs `idiopathic heart disease`, or
     `Mycobacterium tuberculosis GC1237` vs `uninfected control`).
+- **Optional unsigned significance mode (`Ignore direction (rank by significance)`)**:
+  A toggle at the bottom of the sidebar (off by default) switches to
+  `deet_unsigned_ranks_*.parquet`, where genes within each comparison are ranked
+  from `1` (least significant) to `19,444` (most significantly differentially
+  expressed in either direction) using `DESeq2 test-statistic magnitude`
+  (equivalent to `−log10(p_unadjusted)`), tie-broken by `|log2FC|`. This tests
+  whether input genes are enriched for significant differential expression
+  regardless of whether individual genes are upregulated or downregulated.
 
 ## Run locally
 
@@ -131,8 +142,9 @@ clustering; computed on demand and cached for identical inputs).
 
 ## Rebuilding the data shards (optional)
 
-To regenerate `data/deet_ranks_*.parquet` and `data/deet_metadata.parquet` from
-the upstream DEET source archive (`DEET_short_final_Aug2022.rds` from the
+To regenerate `data/deet_ranks_*.parquet`, `data/deet_unsigned_ranks_*.parquet`,
+and `data/deet_metadata.parquet` from the upstream DEET source archive
+(`DEET_short_final_Aug2022.rds` from the
 [Wilson Lab DEET repository](https://www.wilsonlab.org/public/DEET_data/) and
 the metadata table exported from [DEET-shiny](https://wilsonlab-sickkids-uoft.shinyapps.io/DEET-shiny/)
 or [Zenodo (record 7321664)](https://zenodo.org/records/7321664); requires R):

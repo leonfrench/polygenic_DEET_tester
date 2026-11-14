@@ -102,6 +102,13 @@ def get_rank_shard(shard_key: str, file_version: tuple[int, int]) -> RankMatrix:
     return load_rank_matrix(DATA_DIR / f"deet_ranks_{shard_key}.parquet")
 
 
+@st.cache_resource(show_spinner="Loading DEET unsigned significance rank matrix...")
+def get_unsigned_rank_shard(
+    shard_key: str, file_version: tuple[int, int]
+) -> RankMatrix:
+    return load_rank_matrix(DATA_DIR / f"deet_unsigned_ranks_{shard_key}.parquet")
+
+
 @st.cache_resource(show_spinner=False)
 def get_metadata(file_version: tuple[int, int]) -> pd.DataFrame:
     return load_metadata(DATA_DIR / "deet_metadata.parquet")
@@ -112,13 +119,18 @@ def get_ortholog_map():
     return load_ortholog_map(DATA_DIR / "homologene_to_human.csv.gz")
 
 
-def load_selected_shards(dataset_label: str) -> tuple[RankMatrix, ...]:
+def load_selected_shards(
+    dataset_label: str,
+    ignore_direction: bool = False,
+) -> tuple[RankMatrix, ...]:
     shard_keys, _ = DATASETS[dataset_label]
+    prefix = "deet_unsigned_ranks" if ignore_direction else "deet_ranks"
+    loader = get_unsigned_rank_shard if ignore_direction else get_rank_shard
     shards: list[RankMatrix] = []
     for key in shard_keys:
-        shard_path = DATA_DIR / f"deet_ranks_{key}.parquet"
+        shard_path = DATA_DIR / f"{prefix}_{key}.parquet"
         stat = shard_path.stat()
-        shards.append(get_rank_shard(key, (stat.st_mtime_ns, stat.st_size)))
+        shards.append(loader(key, (stat.st_mtime_ns, stat.st_size)))
     return tuple(shards)
 
 
@@ -144,7 +156,11 @@ def filter_shards_by_profiles(
     return tuple(filtered)
 
 
-def format_results_table(table: pd.DataFrame, metadata: pd.DataFrame) -> pd.DataFrame:
+def format_results_table(
+    table: pd.DataFrame,
+    metadata: pd.DataFrame,
+    ignore_direction: bool = False,
+) -> pd.DataFrame:
     merged = table.merge(
         metadata,
         left_on="DEET ID",
@@ -152,7 +168,7 @@ def format_results_table(table: pd.DataFrame, metadata: pd.DataFrame) -> pd.Data
         how="inner",
         sort=False,
     )
-    if {"Group.Up", "Group.Down"}.issubset(merged.columns):
+    if not ignore_direction and {"Group.Up", "Group.Down"}.issubset(merged.columns):
         is_up = merged["Direction"] == "Upregulation of input genes"
         is_down = merged["Direction"] == "Downregulation of input genes"
         higher_group = pd.Series("—", index=merged.index, dtype=object)
@@ -164,10 +180,19 @@ def format_results_table(table: pd.DataFrame, metadata: pd.DataFrame) -> pd.Data
         merged["Higher Group"] = higher_group
         merged["Lower Group"] = lower_group
 
+    group_columns = (
+        ["Sample.Groups"]
+        if ignore_direction
+        else ["Higher Group", "Lower Group"]
+    )
+    tail_columns = (
+        []
+        if ignore_direction
+        else ["Sample.Groups"]
+    )
     preferred_columns = [
         "DEET.Name",
-        "Higher Group",
-        "Lower Group",
+        *group_columns,
         "Source",
         "Tissue",
         "AUROC",
@@ -181,7 +206,7 @@ def format_results_table(table: pd.DataFrame, metadata: pd.DataFrame) -> pd.Data
         "numDEs",
         "numDEup",
         "numDEdown",
-        "Sample.Groups",
+        *tail_columns,
         "Age.Mean.SD",
         "Sexes",
         "Study.ID",
@@ -197,6 +222,7 @@ def create_heatmap_pdf(
     heatmap: pd.DataFrame,
     dataset_label: str,
     label_map: dict[str, str],
+    ignore_direction: bool = False,
 ) -> bytes:
     clustered_heatmap = heatmap
     if heatmap.shape[0] > 1:
@@ -229,12 +255,22 @@ def create_heatmap_pdf(
     axis.set_yticklabels(clustered_heatmap.index, fontsize=6)
     axis.set_xlabel("DEET comparison")
     axis.set_ylabel("Gene")
+    rank_subtitle = (
+        "hierarchically clustered; higher ranks indicate stronger differential expression significance (direction ignored)"
+        if ignore_direction
+        else "hierarchically clustered; higher ranks indicate stronger upregulation (log2FC > 0)"
+    )
+    colorbar_label = (
+        "Unsigned differential expression significance rank"
+        if ignore_direction
+        else "Signed differential expression rank"
+    )
     axis.set_title(
         f"DEET human differential expression — {dataset_label}: "
         f"{heatmap.shape[0]} genes across {heatmap.shape[1]:,} comparisons\n"
-        "hierarchically clustered; higher ranks indicate stronger upregulation (log2FC > 0)"
+        f"{rank_subtitle}"
     )
-    figure.colorbar(image, ax=axis, label="Signed differential expression rank")
+    figure.colorbar(image, ax=axis, label=colorbar_label)
     figure.tight_layout()
 
     output = BytesIO()
@@ -334,6 +370,17 @@ with st.sidebar:
         "[MSigDB `HALLMARK_INTERFERON_ALPHA_RESPONSE`]"
         "(https://www.gsea-msigdb.org/gsea/msigdb/human/geneset/HALLMARK_INTERFERON_ALPHA_RESPONSE.html))."
     )
+    st.divider()
+    ignore_direction = st.toggle(
+        "Ignore direction (rank by significance)",
+        value=False,
+        help=(
+            "Rank genes within each comparison from 1 (least significant) to N "
+            "(most significant regardless of fold-change sign) using unsigned "
+            "DESeq2 test-statistic magnitude (−log10 p), testing for differential "
+            "expression in either direction."
+        ),
+    )
 
 
 saved = None
@@ -363,7 +410,7 @@ try:
     if not target_genes:
         raise ValueError("None of the input genes could be converted to human symbols.")
 
-    shards = load_selected_shards(dataset)
+    shards = load_selected_shards(dataset, ignore_direction=ignore_direction)
     meta_stat = (DATA_DIR / "deet_metadata.parquet").stat()
     metadata = get_metadata((meta_stat.st_mtime_ns, meta_stat.st_size))
 
@@ -385,6 +432,7 @@ try:
         matrix=filtered_shards,
         target_genes=target_genes,
         background_genes=background_genes,
+        ignore_direction=ignore_direction,
     )
     total_profiles = sum(len(shard.profiles) for shard in filtered_shards)
     label_map = dict(zip(metadata["DEET.ID"], metadata["DEET.Name"]))
@@ -394,6 +442,7 @@ try:
                 dataset,
                 selected_category,
                 species,
+                ignore_direction,
                 tuple(target_genes),
                 tuple(background_genes or ()),
             )
@@ -401,7 +450,9 @@ try:
         digest_size=8,
     ).hexdigest()
     saved = {
-        "table": format_results_table(result.table, metadata),
+        "table": format_results_table(
+            result.table, metadata, ignore_direction=ignore_direction
+        ),
         "table_key": table_key,
         "heatmap": result.heatmap,
         "label_map": label_map,
@@ -411,6 +462,7 @@ try:
         "profile_count": total_profiles,
         "selected_category": selected_category,
         "category_slug": category_slug,
+        "ignore_direction": ignore_direction,
         "conversion_unmapped": conversion_unmapped,
         "matrix_unmatched": list(result.unmatched_genes),
     }
@@ -432,6 +484,8 @@ with st.container(key="top_header"):
         if saved["selected_category"] is not None:
             scope_parts.append(f"Category: {saved['selected_category']}")
         scope_parts.append(f"{saved['profile_count']:,} comparisons")
+        if saved["ignore_direction"]:
+            scope_parts.append("unsigned significance ranking (direction ignored)")
         if species != "Human":
             scope_parts.append("unique converted human symbols")
 
@@ -492,6 +546,8 @@ if saved is not None:
     download_prefix = f"deet_human_{DATASETS[dataset][1]}"
     if saved["selected_category"] is not None:
         download_prefix = f"{download_prefix}_{saved['category_slug']}"
+    if saved["ignore_direction"]:
+        download_prefix = f"{download_prefix}_unsigned"
     heatmap_scope = (
         dataset
         if saved["selected_category"] is None
@@ -513,26 +569,40 @@ if saved is not None:
                 saved["heatmap"],
                 heatmap_scope,
                 saved["label_map"],
+                saved["ignore_direction"],
             ),
             file_name=f"{download_prefix}_heatmap.pdf",
             mime="application/pdf",
             type="tertiary",
             on_click="ignore",
         )
-    st.caption(
-        "Genes are ranked within each comparison from 1 (most significantly "
-        "downregulated, log2FC < 0) to N (most significantly upregulated, log2FC > 0) "
-        "using sign(log2FC) × DESeq2 test-statistic magnitude (equivalent to "
-        "sign(log2FC) × −log10(p) using unadjusted p-values, avoiding padj = 1 ties), "
-        "with log2FC breaking any remaining ties. AUROC compares matched target genes "
-        "against non-target background genes via within-comparison rank sums; two-sided "
-        "p-values use the continuity-corrected normal approximation, and FDR uses "
-        "Benjamini–Hochberg across the filtered comparisons tested."
-    )
-    st.caption(
-        "Direction convention: 'Higher Group' and 'Lower Group' list the two sample "
-        "groups in each comparison ordered by higher vs. lower expression of the input "
-        "gene set. When AUROC > 0.5, Higher Group is DEET's positive log2FC / Top DEGs "
-        "(Up) group; when AUROC < 0.5, Higher Group is DEET's negative log2FC / Top DEGs "
-        "(Down) reference group."
-    )
+    if saved["ignore_direction"]:
+        st.caption(
+            "Unsigned significance mode (direction ignored): Genes are ranked within "
+            "each comparison from 1 (least significant) to N (most significantly "
+            "differentially expressed in either direction) using DESeq2 test-statistic "
+            "magnitude (equivalent to −log10(p) using unadjusted p-values, avoiding "
+            "padj = 1 ties), with |log2FC| breaking any remaining ties. AUROC > 0.5 "
+            "indicates input genes are more significantly differentially expressed "
+            "(upregulated, downregulated, or mixed) than non-target background genes; "
+            "two-sided p-values use the continuity-corrected normal approximation, and "
+            "FDR uses Benjamini–Hochberg across the filtered comparisons tested."
+        )
+    else:
+        st.caption(
+            "Genes are ranked within each comparison from 1 (most significantly "
+            "downregulated, log2FC < 0) to N (most significantly upregulated, log2FC > 0) "
+            "using sign(log2FC) × DESeq2 test-statistic magnitude (equivalent to "
+            "sign(log2FC) × −log10(p) using unadjusted p-values, avoiding padj = 1 ties), "
+            "with log2FC breaking any remaining ties. AUROC compares matched target genes "
+            "against non-target background genes via within-comparison rank sums; two-sided "
+            "p-values use the continuity-corrected normal approximation, and FDR uses "
+            "Benjamini–Hochberg across the filtered comparisons tested."
+        )
+        st.caption(
+            "Direction convention: 'Higher Group' and 'Lower Group' list the two sample "
+            "groups in each comparison ordered by higher vs. lower expression of the input "
+            "gene set. When AUROC > 0.5, Higher Group is DEET's positive log2FC / Top DEGs "
+            "(Up) group; when AUROC < 0.5, Higher Group is DEET's negative log2FC / Top DEGs "
+            "(Down) reference group."
+        )

@@ -216,6 +216,7 @@ def run_auroc_analysis(
     target_genes: Sequence[str],
     background_genes: Sequence[str] | None = None,
     group_labels: Mapping[str, tuple[str, str]] | None = None,
+    ignore_direction: bool = False,
 ) -> AnalysisResult:
     shards: tuple[RankMatrix, ...] = (
         (matrix,) if isinstance(matrix, RankMatrix) else tuple(matrix)
@@ -289,7 +290,13 @@ def run_auroc_analysis(
     p_values = get_p_from_auc(n_target, n_negative, aucs)
     fdr_values = _benjamini_hochberg(p_values)
 
-    if group_labels is not None:
+    if ignore_direction:
+        directions = np.where(
+            aucs > 0.5,
+            "Higher significance of input genes",
+            np.where(aucs < 0.5, "Lower significance of input genes", "Neutral"),
+        )
+    elif group_labels is not None:
         directions_list: list[str] = []
         for profile_id, auc in zip(all_profiles, aucs):
             pair = group_labels.get(profile_id)
