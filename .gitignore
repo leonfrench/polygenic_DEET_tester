@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Unit test / coverage reports
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+
+# Ruff / mypy
+.ruff_cache/
+.mypy_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# macOS / RStudio
+.DS_Store
+.Rproj.user
