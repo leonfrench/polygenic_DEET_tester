@@ -475,7 +475,7 @@ if saved is not None:
         st.dataframe(
             display_table,
             column_config={
-                "DEET.Name": st.column_config.TextColumn("DEET Name", width="large"),
+                "DEET.Name": st.column_config.TextColumn("DEET Name", width=280),
                 "Higher Group": st.column_config.TextColumn("Higher Group", width="medium"),
                 "Lower Group": st.column_config.TextColumn("Lower Group", width="medium"),
                 "Tissue": st.column_config.TextColumn("Tissue", width="medium"),
