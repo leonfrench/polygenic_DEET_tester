@@ -309,7 +309,7 @@ with st.sidebar:
     gene_text = st.text_area(
         "Input your gene list:",
         value=DEFAULT_GENES,
-        height=220,
+        height=90,
     )
     background_text = st.text_area(
         "Background gene list (optional):",
